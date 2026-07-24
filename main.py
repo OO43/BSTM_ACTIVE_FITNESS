@@ -144,7 +144,7 @@ class User(BaseModel):
 fake_users_db = {
     "admin": {
         "username": "admin",
-        "hashed_password": pwd_context.hash("adminpass")
+        "hashed_password": pwd_context.hash("adminpass"[:72])
     }
 }
 
