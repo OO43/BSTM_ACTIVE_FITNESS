@@ -148,34 +148,15 @@ class FacilityOut(FacilityBase):
 class User(BaseModel):
     username: str
 
-# Initialize users database with lazy hashing
-fake_users_db = {}
-
-def initialize_users():
-    """Initialize users on startup with hashed passwords from environment"""
-    global fake_users_db
-    
-    # Load from environment variable (JSON format)
-    users_json = os.getenv("USERS_JSON", '{"admin": "adminpass"}')
-    
-    try:
-        users_data = json.loads(users_json)
-        for username, plaintext_pw in users_data.items():
-            # Hash password and store, discard plaintext immediately
-            fake_users_db[username] = {
-                "username": username,
-                "hashed_password": pwd_context.hash(plaintext_pw[:72])  # Limit to 72 chars (bcrypt limit)
-            }
-        logger.info(f"Initialized {len(fake_users_db)} user(s)")
-    except json.JSONDecodeError:
-        logger.error("Invalid JSON in USERS_JSON environment variable. Using default admin user.")
-        fake_users_db["admin"] = {
-            "username": "admin",
-            "hashed_password": pwd_context.hash("adminpass"[:72])
-        }
-
-# Initialize on startup
-initialize_users()
+# Initialize users database with plaintext passwords.
+# Passwords are hashed lazily on login (see authenticate_user) so bcrypt's
+# backend is never initialized at import time.
+fake_users_db = {
+    "admin": {
+        "username": "admin",
+        "password": "adminpass"
+    }
+}
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -188,7 +169,9 @@ def authenticate_user(username: str, password: str):
     if not user:
         logger.warning(f"Login attempt for non-existent user: {username}")
         return False
-    if not verify_password(password, user["hashed_password"]):
+    # Hash the password only when needed (on login)
+    hashed_password = pwd_context.hash(user["password"][:72])
+    if not verify_password(password, hashed_password):
         logger.warning(f"Failed login attempt for user: {username}")
         return False
     logger.info(f"Successful login for user: {username}")
