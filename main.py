@@ -144,7 +144,7 @@ class User(BaseModel):
 fake_users_db = {
     "admin": {
         "username": "admin",
-        "hashed_password": pwd_context.hash("adminpass"[:72])
+        "password": "adminpass"
     }
 }
 
@@ -158,7 +158,11 @@ def authenticate_user(username: str, password: str):
     user = fake_users_db.get(username)
     if not user:
         return False
-    if not verify_password(password, user["hashed_password"]):
+    # Hash the stored password lazily (on first use) instead of at module
+    # import time, to avoid triggering bcrypt's backend initialization
+    # during application startup.
+    hashed_password = get_password_hash(user["password"])
+    if not verify_password(password, hashed_password):
         return False
     return user
 
