@@ -9,20 +9,29 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 import os
+import json
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# JWT settings
-SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key_here")
+# JWT settings - enforce SECRET_KEY in production
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    logger.warning("SECRET_KEY not set in environment. Using default for development only.")
+    SECRET_KEY = "your_secret_key_here_change_in_production"
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 
-# Pydantic schemas
 # Pydantic schemas
 class CustomerBase(BaseModel):
     First_Name: str
@@ -136,30 +145,53 @@ class FacilityOut(FacilityBase):
     class Config:
         orm_mode = True
 
-# User model (add to models.py for production use)
 class User(BaseModel):
     username: str
-    password: str
 
-fake_users_db = {
-    "admin": {
-        "username": "admin",
-        "hashed_password": pwd_context.hash("adminpass"[:72])
-    }
-}
+# Initialize users database with lazy hashing
+fake_users_db = {}
+
+def initialize_users():
+    """Initialize users on startup with hashed passwords from environment"""
+    global fake_users_db
+    
+    # Load from environment variable (JSON format)
+    users_json = os.getenv("USERS_JSON", '{"admin": "adminpass"}')
+    
+    try:
+        users_data = json.loads(users_json)
+        for username, plaintext_pw in users_data.items():
+            # Hash password and store, discard plaintext immediately
+            fake_users_db[username] = {
+                "username": username,
+                "hashed_password": pwd_context.hash(plaintext_pw[:72])  # Limit to 72 chars (bcrypt limit)
+            }
+        logger.info(f"Initialized {len(fake_users_db)} user(s)")
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON in USERS_JSON environment variable. Using default admin user.")
+        fake_users_db["admin"] = {
+            "username": "admin",
+            "hashed_password": pwd_context.hash("adminpass"[:72])
+        }
+
+# Initialize on startup
+initialize_users()
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
 def get_password_hash(password):
-    return pwd_context.hash(password)
+    return pwd_context.hash(password[:72])
 
 def authenticate_user(username: str, password: str):
     user = fake_users_db.get(username)
     if not user:
+        logger.warning(f"Login attempt for non-existent user: {username}")
         return False
     if not verify_password(password, user["hashed_password"]):
+        logger.warning(f"Failed login attempt for user: {username}")
         return False
+    logger.info(f"Successful login for user: {username}")
     return user
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
@@ -195,18 +227,17 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     access_token = create_access_token(data={"sub": user["username"]}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     return {"access_token": access_token, "token_type": "bearer"}
 
-# Example of a protected route
 @app.get("/users/me", tags=["Auth"])
 async def read_users_me(current_user: dict = Depends(get_current_user)):
-    return current_user
+    return {"username": current_user["username"]}
 
 @app.get("/", tags=["Root"])
 def home():
-    return {"Hello": "World"}
+    return {"message": "BSTM Active Fitness API", "version": "1.0.0"}
 
 # CRUD for Customer
 @app.post("/customers/", response_model=CustomerOut, tags=["Customers"])
-def create_customer(customer: CustomerCreate, db: Session = Depends(get_db)):
+def create_customer(customer: CustomerCreate, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_customer = db.query(models.Customer).filter(models.Customer.Customer_ID == customer.Customer_ID).first()
     if db_customer:
         raise HTTPException(status_code=400, detail="Customer ID already exists")
@@ -217,19 +248,19 @@ def create_customer(customer: CustomerCreate, db: Session = Depends(get_db)):
     return new_customer
 
 @app.get("/customers/", response_model=List[CustomerOut], tags=["Customers"])
-def read_customers(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def read_customers(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), _=Depends(get_current_user)):
     customers = db.query(models.Customer).offset(skip).limit(limit).all()
     return customers
 
 @app.get("/customers/{customer_id}", response_model=CustomerOut, tags=["Customers"])
-def read_customer(customer_id: str, db: Session = Depends(get_db)):
+def read_customer(customer_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     customer = db.query(models.Customer).filter(models.Customer.Customer_ID == customer_id).first()
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
     return customer
 
 @app.put("/customers/{customer_id}", response_model=CustomerOut, tags=["Customers"])
-def update_customer(customer_id: str, customer: CustomerBase, db: Session = Depends(get_db)):
+def update_customer(customer_id: str, customer: CustomerBase, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_customer = db.query(models.Customer).filter(models.Customer.Customer_ID == customer_id).first()
     if not db_customer:
         raise HTTPException(status_code=404, detail="Customer not found")
@@ -240,7 +271,7 @@ def update_customer(customer_id: str, customer: CustomerBase, db: Session = Depe
     return db_customer
 
 @app.delete("/customers/{customer_id}", tags=["Customers"])
-def delete_customer(customer_id: str, db: Session = Depends(get_db)):
+def delete_customer(customer_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_customer = db.query(models.Customer).filter(models.Customer.Customer_ID == customer_id).first()
     if not db_customer:
         raise HTTPException(status_code=404, detail="Customer not found")
@@ -250,7 +281,7 @@ def delete_customer(customer_id: str, db: Session = Depends(get_db)):
 
 # CRUD for Staff
 @app.post("/staff/", response_model=StaffOut, tags=["Staff"])
-def create_staff(staff: StaffCreate, db: Session = Depends(get_db)):
+def create_staff(staff: StaffCreate, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_staff = db.query(models.Staff).filter(models.Staff.Staff_ID == staff.Staff_ID).first()
     if db_staff:
         raise HTTPException(status_code=400, detail="Staff ID already exists")
@@ -261,19 +292,19 @@ def create_staff(staff: StaffCreate, db: Session = Depends(get_db)):
     return new_staff
 
 @app.get("/staff/", response_model=List[StaffOut], tags=["Staff"])
-def read_staff(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def read_staff(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), _=Depends(get_current_user)):
     staff = db.query(models.Staff).offset(skip).limit(limit).all()
     return staff
 
 @app.get("/staff/{staff_id}", response_model=StaffOut, tags=["Staff"])
-def read_staff_member(staff_id: str, db: Session = Depends(get_db)):
+def read_staff_member(staff_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     staff = db.query(models.Staff).filter(models.Staff.Staff_ID == staff_id).first()
     if not staff:
         raise HTTPException(status_code=404, detail="Staff not found")
     return staff
 
 @app.put("/staff/{staff_id}", response_model=StaffOut, tags=["Staff"])
-def update_staff(staff_id: str, staff: StaffBase, db: Session = Depends(get_db)):
+def update_staff(staff_id: str, staff: StaffBase, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_staff = db.query(models.Staff).filter(models.Staff.Staff_ID == staff_id).first()
     if not db_staff:
         raise HTTPException(status_code=404, detail="Staff not found")
@@ -284,7 +315,7 @@ def update_staff(staff_id: str, staff: StaffBase, db: Session = Depends(get_db))
     return db_staff
 
 @app.delete("/staff/{staff_id}", tags=["Staff"])
-def delete_staff(staff_id: str, db: Session = Depends(get_db)):
+def delete_staff(staff_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_staff = db.query(models.Staff).filter(models.Staff.Staff_ID == staff_id).first()
     if not db_staff:
         raise HTTPException(status_code=404, detail="Staff not found")
@@ -294,7 +325,7 @@ def delete_staff(staff_id: str, db: Session = Depends(get_db)):
 
 # CRUD for Branch
 @app.post("/branches/", response_model=BranchOut, tags=["Branch"])
-def create_branch(branch: BranchCreate, db: Session = Depends(get_db)):
+def create_branch(branch: BranchCreate, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_branch = db.query(models.Branch).filter(models.Branch.Branch_ID == branch.Branch_ID).first()
     if db_branch:
         raise HTTPException(status_code=400, detail="Branch ID already exists")
@@ -305,19 +336,19 @@ def create_branch(branch: BranchCreate, db: Session = Depends(get_db)):
     return new_branch
 
 @app.get("/branches/", response_model=List[BranchOut], tags=["Branch"])
-def read_branches(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def read_branches(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), _=Depends(get_current_user)):
     branches = db.query(models.Branch).offset(skip).limit(limit).all()
     return branches
 
 @app.get("/branches/{branch_id}", response_model=BranchOut, tags=["Branch"])
-def read_branch(branch_id: str, db: Session = Depends(get_db)):
+def read_branch(branch_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     branch = db.query(models.Branch).filter(models.Branch.Branch_ID == branch_id).first()
     if not branch:
         raise HTTPException(status_code=404, detail="Branch not found")
     return branch
 
 @app.put("/branches/{branch_id}", response_model=BranchOut, tags=["Branch"])
-def update_branch(branch_id: str, branch: BranchBase, db: Session = Depends(get_db)):
+def update_branch(branch_id: str, branch: BranchBase, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_branch = db.query(models.Branch).filter(models.Branch.Branch_ID == branch_id).first()
     if not db_branch:
         raise HTTPException(status_code=404, detail="Branch not found")
@@ -328,7 +359,7 @@ def update_branch(branch_id: str, branch: BranchBase, db: Session = Depends(get_
     return db_branch
 
 @app.delete("/branches/{branch_id}", tags=["Branch"])
-def delete_branch(branch_id: str, db: Session = Depends(get_db)):
+def delete_branch(branch_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_branch = db.query(models.Branch).filter(models.Branch.Branch_ID == branch_id).first()
     if not db_branch:
         raise HTTPException(status_code=404, detail="Branch not found")
@@ -338,7 +369,7 @@ def delete_branch(branch_id: str, db: Session = Depends(get_db)):
 
 # CRUD for Vendor
 @app.post("/vendors/", response_model=VendorOut, tags=["Vendor"])
-def create_vendor(vendor: VendorCreate, db: Session = Depends(get_db)):
+def create_vendor(vendor: VendorCreate, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_vendor = db.query(models.Vendor).filter(models.Vendor.Vendor_ID == vendor.Vendor_ID).first()
     if db_vendor:
         raise HTTPException(status_code=400, detail="Vendor ID already exists")
@@ -349,19 +380,19 @@ def create_vendor(vendor: VendorCreate, db: Session = Depends(get_db)):
     return new_vendor
 
 @app.get("/vendors/", response_model=List[VendorOut], tags=["Vendor"])
-def read_vendors(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def read_vendors(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), _=Depends(get_current_user)):
     vendors = db.query(models.Vendor).offset(skip).limit(limit).all()
     return vendors
 
 @app.get("/vendors/{vendor_id}", response_model=VendorOut, tags=["Vendor"])
-def read_vendor(vendor_id: str, db: Session = Depends(get_db)):
+def read_vendor(vendor_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     vendor = db.query(models.Vendor).filter(models.Vendor.Vendor_ID == vendor_id).first()
     if not vendor:
         raise HTTPException(status_code=404, detail="Vendor not found")
     return vendor
 
 @app.put("/vendors/{vendor_id}", response_model=VendorOut, tags=["Vendor"])
-def update_vendor(vendor_id: str, vendor: VendorBase, db: Session = Depends(get_db)):
+def update_vendor(vendor_id: str, vendor: VendorBase, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_vendor = db.query(models.Vendor).filter(models.Vendor.Vendor_ID == vendor_id).first()
     if not db_vendor:
         raise HTTPException(status_code=404, detail="Vendor not found")
@@ -372,7 +403,7 @@ def update_vendor(vendor_id: str, vendor: VendorBase, db: Session = Depends(get_
     return db_vendor
 
 @app.delete("/vendors/{vendor_id}", tags=["Vendor"])
-def delete_vendor(vendor_id: str, db: Session = Depends(get_db)):
+def delete_vendor(vendor_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_vendor = db.query(models.Vendor).filter(models.Vendor.Vendor_ID == vendor_id).first()
     if not db_vendor:
         raise HTTPException(status_code=404, detail="Vendor not found")
@@ -382,7 +413,7 @@ def delete_vendor(vendor_id: str, db: Session = Depends(get_db)):
 
 # CRUD for Manager
 @app.post("/managers/", response_model=ManagerOut, tags=["Manager"])
-def create_manager(manager: ManagerCreate, db: Session = Depends(get_db)):
+def create_manager(manager: ManagerCreate, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_manager = db.query(models.Manager).filter(models.Manager.Manager_ID == manager.Manager_ID).first()
     if db_manager:
         raise HTTPException(status_code=400, detail="Manager ID already exists")
@@ -393,19 +424,19 @@ def create_manager(manager: ManagerCreate, db: Session = Depends(get_db)):
     return new_manager
 
 @app.get("/managers/", response_model=List[ManagerOut], tags=["Manager"])
-def read_managers(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def read_managers(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), _=Depends(get_current_user)):
     managers = db.query(models.Manager).offset(skip).limit(limit).all()
     return managers
 
 @app.get("/managers/{manager_id}", response_model=ManagerOut, tags=["Manager"])
-def read_manager(manager_id: str, db: Session = Depends(get_db)):
+def read_manager(manager_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     manager = db.query(models.Manager).filter(models.Manager.Manager_ID == manager_id).first()
     if not manager:
         raise HTTPException(status_code=404, detail="Manager not found")
     return manager
 
 @app.put("/managers/{manager_id}", response_model=ManagerOut, tags=["Manager"])
-def update_manager(manager_id: str, manager: ManagerBase, db: Session = Depends(get_db)):
+def update_manager(manager_id: str, manager: ManagerBase, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_manager = db.query(models.Manager).filter(models.Manager.Manager_ID == manager_id).first()
     if not db_manager:
         raise HTTPException(status_code=404, detail="Manager not found")
@@ -416,7 +447,7 @@ def update_manager(manager_id: str, manager: ManagerBase, db: Session = Depends(
     return db_manager
 
 @app.delete("/managers/{manager_id}", tags=["Manager"])
-def delete_manager(manager_id: str, db: Session = Depends(get_db)):
+def delete_manager(manager_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_manager = db.query(models.Manager).filter(models.Manager.Manager_ID == manager_id).first()
     if not db_manager:
         raise HTTPException(status_code=404, detail="Manager not found")
@@ -426,7 +457,7 @@ def delete_manager(manager_id: str, db: Session = Depends(get_db)):
 
 # CRUD for Membership
 @app.post("/memberships/", response_model=MembershipOut, tags=["Membership"])
-def create_membership(membership: MembershipCreate, db: Session = Depends(get_db)):
+def create_membership(membership: MembershipCreate, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_membership = db.query(models.Membership).filter(models.Membership.MembershipCard_ID == membership.MembershipCard_ID).first()
     if db_membership:
         raise HTTPException(status_code=400, detail="MembershipCard ID already exists")
@@ -437,19 +468,19 @@ def create_membership(membership: MembershipCreate, db: Session = Depends(get_db
     return new_membership
 
 @app.get("/memberships/", response_model=List[MembershipOut], tags=["Membership"])
-def read_memberships(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def read_memberships(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), _=Depends(get_current_user)):
     memberships = db.query(models.Membership).offset(skip).limit(limit).all()
     return memberships
 
 @app.get("/memberships/{membership_id}", response_model=MembershipOut, tags=["Membership"])
-def read_membership(membership_id: int, db: Session = Depends(get_db)):
+def read_membership(membership_id: int, db: Session = Depends(get_db), _=Depends(get_current_user)):
     membership = db.query(models.Membership).filter(models.Membership.MembershipCard_ID == membership_id).first()
     if not membership:
         raise HTTPException(status_code=404, detail="Membership not found")
     return membership
 
 @app.put("/memberships/{membership_id}", response_model=MembershipOut, tags=["Membership"])
-def update_membership(membership_id: int, membership: MembershipBase, db: Session = Depends(get_db)):
+def update_membership(membership_id: int, membership: MembershipBase, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_membership = db.query(models.Membership).filter(models.Membership.MembershipCard_ID == membership_id).first()
     if not db_membership:
         raise HTTPException(status_code=404, detail="Membership not found")
@@ -460,7 +491,7 @@ def update_membership(membership_id: int, membership: MembershipBase, db: Sessio
     return db_membership
 
 @app.delete("/memberships/{membership_id}", tags=["Membership"])
-def delete_membership(membership_id: int, db: Session = Depends(get_db)):
+def delete_membership(membership_id: int, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_membership = db.query(models.Membership).filter(models.Membership.MembershipCard_ID == membership_id).first()
     if not db_membership:
         raise HTTPException(status_code=404, detail="Membership not found")
@@ -470,7 +501,7 @@ def delete_membership(membership_id: int, db: Session = Depends(get_db)):
 
 # CRUD for Payment
 @app.post("/payments/", response_model=PaymentOut, tags=["Payment"])
-def create_payment(payment: PaymentCreate, db: Session = Depends(get_db)):
+def create_payment(payment: PaymentCreate, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_payment = db.query(models.Payment).filter(models.Payment.Transaction_ID == payment.Transaction_ID).first()
     if db_payment:
         raise HTTPException(status_code=400, detail="Transaction ID already exists")
@@ -481,19 +512,19 @@ def create_payment(payment: PaymentCreate, db: Session = Depends(get_db)):
     return new_payment
 
 @app.get("/payments/", response_model=List[PaymentOut], tags=["Payment"])
-def read_payments(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def read_payments(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), _=Depends(get_current_user)):
     payments = db.query(models.Payment).offset(skip).limit(limit).all()
     return payments
 
 @app.get("/payments/{transaction_id}", response_model=PaymentOut, tags=["Payment"])
-def read_payment(transaction_id: str, db: Session = Depends(get_db)):
+def read_payment(transaction_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     payment = db.query(models.Payment).filter(models.Payment.Transaction_ID == transaction_id).first()
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
     return payment
 
 @app.put("/payments/{transaction_id}", response_model=PaymentOut, tags=["Payment"])
-def update_payment(transaction_id: str, payment: PaymentBase, db: Session = Depends(get_db)):
+def update_payment(transaction_id: str, payment: PaymentBase, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_payment = db.query(models.Payment).filter(models.Payment.Transaction_ID == transaction_id).first()
     if not db_payment:
         raise HTTPException(status_code=404, detail="Payment not found")
@@ -504,7 +535,7 @@ def update_payment(transaction_id: str, payment: PaymentBase, db: Session = Depe
     return db_payment
 
 @app.delete("/payments/{transaction_id}", tags=["Payment"])
-def delete_payment(transaction_id: str, db: Session = Depends(get_db)):
+def delete_payment(transaction_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_payment = db.query(models.Payment).filter(models.Payment.Transaction_ID == transaction_id).first()
     if not db_payment:
         raise HTTPException(status_code=404, detail="Payment not found")
@@ -514,7 +545,7 @@ def delete_payment(transaction_id: str, db: Session = Depends(get_db)):
 
 # CRUD for Facility
 @app.post("/facilities/", response_model=FacilityOut, tags=["Facility"])
-def create_facility(facility: FacilityCreate, db: Session = Depends(get_db)):
+def create_facility(facility: FacilityCreate, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_facility = db.query(models.Facility).filter(models.Facility.Facility_ID == facility.Facility_ID).first()
     if db_facility:
         raise HTTPException(status_code=400, detail="Facility ID already exists")
@@ -525,19 +556,19 @@ def create_facility(facility: FacilityCreate, db: Session = Depends(get_db)):
     return new_facility
 
 @app.get("/facilities/", response_model=List[FacilityOut], tags=["Facility"])
-def read_facilities(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def read_facilities(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), _=Depends(get_current_user)):
     facilities = db.query(models.Facility).offset(skip).limit(limit).all()
     return facilities
 
 @app.get("/facilities/{facility_id}", response_model=FacilityOut, tags=["Facility"])
-def read_facility(facility_id: str, db: Session = Depends(get_db)):
+def read_facility(facility_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     facility = db.query(models.Facility).filter(models.Facility.Facility_ID == facility_id).first()
     if not facility:
         raise HTTPException(status_code=404, detail="Facility not found")
     return facility
 
 @app.put("/facilities/{facility_id}", response_model=FacilityOut, tags=["Facility"])
-def update_facility(facility_id: str, facility: FacilityBase, db: Session = Depends(get_db)):
+def update_facility(facility_id: str, facility: FacilityBase, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_facility = db.query(models.Facility).filter(models.Facility.Facility_ID == facility_id).first()
     if not db_facility:
         raise HTTPException(status_code=404, detail="Facility not found")
@@ -548,11 +579,10 @@ def update_facility(facility_id: str, facility: FacilityBase, db: Session = Depe
     return db_facility
 
 @app.delete("/facilities/{facility_id}", tags=["Facility"])
-def delete_facility(facility_id: str, db: Session = Depends(get_db)):
+def delete_facility(facility_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     db_facility = db.query(models.Facility).filter(models.Facility.Facility_ID == facility_id).first()
     if not db_facility:
         raise HTTPException(status_code=404, detail="Facility not found")
     db.delete(db_facility)
     db.commit()
     return {"detail": "Facility deleted"}
-
